@@ -19,6 +19,17 @@
 std::random_device rd;
 std::mt19937 gen(rd());
 
+struct Key {
+    canid_t id;
+    uint8_t counter;
+
+    bool operator<(const Key &o) const {
+        if (id != o.id)
+            return id < o.id;
+        return counter < o.counter;
+    }
+};
+
 uint32_t random_id(const std::string &id_type) { // NOLINT(*-no-recursion)
     if (id_type == "short") {
         std::uniform_int_distribution<uint32_t> dis(0, 0x7FF);
@@ -38,17 +49,6 @@ uint8_t random_len() {
     std::uniform_int_distribution<uint8_t> dis(1, 8);
     return dis(gen);
 }
-
-struct Key {
-    canid_t id;
-    uint8_t counter;
-
-    bool operator<(const Key &o) const {
-        if (id != o.id)
-            return id < o.id;
-        return counter < o.counter;
-    }
-};
 
 int open_can_socket(const std::string &ifname) {
     int s = socket(PF_CAN, SOCK_RAW, CAN_RAW);
@@ -130,18 +130,18 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    int snd_buf = 500000;
     int s_send = open_can_socket(if_ref);
     if (s_send < 0)
         return 1;
-    int snd_buf = 500000;
     setsockopt(s_send, SOL_SOCKET, SO_SNDBUF, &snd_buf, sizeof(snd_buf));
 
+    int rcv_buf = 500000;
     int s_recv = open_can_socket(if_test);
     if (s_recv < 0)
         return 1;
     int flags = fcntl(s_recv, F_GETFL, 0);
     fcntl(s_recv, F_SETFL, flags | O_NONBLOCK);
-    int rcv_buf = 500000;
     setsockopt(s_recv, SOL_SOCKET, SO_RCVBUF, &rcv_buf, sizeof(rcv_buf));
 
     std::set<Key> sent_set;
@@ -156,6 +156,9 @@ int main(int argc, char *argv[]) {
 
     // Прием в отдельном потоке
     std::thread recv_thread([&]() {
+        auto last_receive_time = std::chrono::steady_clock::now();
+        const auto timeout = std::chrono::seconds(5);
+
         while (!sending_done.load() || recv_set.size() < sent_set.size()) {
             struct can_frame frame{};
             int n = read(s_recv, &frame, sizeof(frame));
@@ -166,7 +169,15 @@ int main(int argc, char *argv[]) {
                     recv_set.insert(k);
                 }
                 write_cap_line(recv_cap, if_test.c_str(), frame);
+                last_receive_time = std::chrono::steady_clock::now(); // Обновляем время
             } else {
+                if (sending_done.load()) {
+                    auto now = std::chrono::steady_clock::now();
+                    if (now - last_receive_time > timeout) {
+                        std::cout << "Таймаут: фреймы не поступают более " << timeout.count() << " секунд.\n";
+                        break;
+                    }
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
         }
