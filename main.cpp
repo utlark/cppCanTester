@@ -9,8 +9,6 @@
 #include <random>
 #include <chrono>
 #include <thread>
-#include <set>
-#include <mutex>
 #include <atomic>
 #include <iomanip>
 #include <fcntl.h>
@@ -19,18 +17,7 @@
 std::random_device rd;
 std::mt19937 gen(rd());
 
-struct Key {
-    canid_t id;
-    uint8_t counter;
-
-    bool operator<(const Key &o) const {
-        if (id != o.id)
-            return id < o.id;
-        return counter < o.counter;
-    }
-};
-
-uint32_t random_id(const std::string &id_type) { // NOLINT(*-no-recursion)
+uint32_t random_id(const std::string &id_type) {
     if (id_type == "short") {
         std::uniform_int_distribution<uint32_t> dis(0, 0x7FF);
         return dis(gen);
@@ -41,7 +28,8 @@ uint32_t random_id(const std::string &id_type) { // NOLINT(*-no-recursion)
         std::uniform_int_distribution<int> dis(0, 1);
         if (dis(gen))
             return random_id("short");
-        else return random_id("long");
+        else
+            return random_id("long");
     }
 }
 
@@ -82,12 +70,10 @@ void write_cap_line(std::ofstream &f, const char *iface, const struct can_frame 
     struct timeval tv{};
     gettimeofday(&tv, nullptr);
 
-    // Время в секундах и микросекундах: 10 знаков до точки, 6 после
     f << "(" << std::setw(10) << std::setfill('0') << tv.tv_sec << "."
       << std::setw(6) << std::setfill('0') << tv.tv_usec << ") "
       << iface << " ";
 
-    // CAN ID — 3 символа (стандарт) или 8 (extended), HEX без 0x
     if (frame.can_id & CAN_EFF_FLAG)
         f << std::hex << std::uppercase << std::setw(8) << std::setfill('0') << (frame.can_id & CAN_EFF_MASK);
     else
@@ -100,139 +86,119 @@ void write_cap_line(std::ofstream &f, const char *iface, const struct can_frame 
     f << std::dec << "\n";
 }
 
+void sender(int sock, std::ofstream &log, std::atomic<bool> &running, const std::string &iface, const std::string &id_type, std::atomic<uint32_t> &counter,
+            std::atomic<size_t> &stat_sent) {
+    while (running) {
+        struct can_frame frame{};
+
+        frame.can_id = random_id(id_type);
+        frame.can_dlc = random_len();
+        frame.data[0] = (counter++) & 0xFF;
+        for (int b = 1; b < frame.can_dlc; ++b)
+            frame.data[b] = std::uniform_int_distribution<uint8_t>(0, 255)(gen);
+
+        int n = write(sock, &frame, sizeof(frame));
+        if (n == sizeof(frame)) {
+            write_cap_line(log, iface.c_str(), frame);
+            ++stat_sent;
+        }
+    }
+}
+
+void receiver(int sock, std::ofstream &log, std::atomic<bool> &running, const std::string &iface, std::atomic<size_t> &stat_recv, const std::atomic<size_t> &stat_sent) {
+    auto last_receive_time = std::chrono::steady_clock::now();
+    const auto timeout = std::chrono::seconds(10);
+
+    while (true) {
+        if (!running.load()) {
+            if (stat_recv.load() >= stat_sent.load())
+                break;
+
+            auto now = std::chrono::steady_clock::now();
+            if (now - last_receive_time > timeout) {
+                std::cout << "Таймаут на " << iface << ": принято " << stat_recv << " из " << stat_sent << " сообщений.\n";
+                break;
+            }
+        }
+
+        struct can_frame frame{};
+        int n = read(sock, &frame, sizeof(frame));
+        if (n == sizeof(frame)) {
+            write_cap_line(log, iface.c_str(), frame);
+            ++stat_recv;
+
+            last_receive_time = std::chrono::steady_clock::now();
+        }
+    }
+}
+
 int main(int argc, char *argv[]) {
-    if (argc != 6) {
+    if (argc != 5) {
         std::cout << "Usage: " << argv[0]
-                  << " <if_ref> <if_test> <id_type:short|long|mix> <msg_per_sec|max> <sec>\n";
-        std::cout << "Пример: ./cppCanTester can0 can1 short 100 5\n";
-        std::cout << "        ./cppCanTester can0 can1 mix max 3\n";
+                  << " <if_ref> <if_test> <id_type:short|long|mix> <sec>\n";
+        std::cout << "Пример: ./cppCanFullDuplexTester can0 can1 mix 5\n";
         return 1;
     }
 
     std::string if_ref = argv[1];
     std::string if_test = argv[2];
     std::string id_type = argv[3];
-    std::string rate_str = argv[4];
-    int seconds = std::stoi(argv[5]);
-    int msg_per_sec = 0;
-    bool max_mode = false;
-    if (rate_str == "max") {
-        max_mode = true;
-    } else {
-        msg_per_sec = std::stoi(rate_str);
-        if (msg_per_sec <= 0) {
-            std::cerr << "msg_per_sec должен быть > 0 либо 'max'\n";
-            return 1;
-        }
-    }
+    int seconds = std::stoi(argv[4]);
     if (!(id_type == "short" || id_type == "long" || id_type == "mix")) {
         std::cerr << "Неверный тип id. Должно быть short, long или mix\n";
         return 1;
     }
 
-    int snd_buf = 500000;
-    int s_send = open_can_socket(if_ref);
-    if (s_send < 0)
-        return 1;
-    setsockopt(s_send, SOL_SOCKET, SO_SNDBUF, &snd_buf, sizeof(snd_buf));
+    int s_ref = open_can_socket(if_ref);
+    int s_test = open_can_socket(if_test);
+    if (s_ref < 0 || s_test < 0) return 1;
 
-    int rcv_buf = 500000;
-    int s_recv = open_can_socket(if_test);
-    if (s_recv < 0)
-        return 1;
-    int flags = fcntl(s_recv, F_GETFL, 0);
-    fcntl(s_recv, F_SETFL, flags | O_NONBLOCK);
-    setsockopt(s_recv, SOL_SOCKET, SO_RCVBUF, &rcv_buf, sizeof(rcv_buf));
+    int big_buf = 500000;
+    setsockopt(s_ref, SOL_SOCKET, SO_SNDBUF, &big_buf, sizeof(big_buf));
+    setsockopt(s_ref, SOL_SOCKET, SO_RCVBUF, &big_buf, sizeof(big_buf));
+    setsockopt(s_test, SOL_SOCKET, SO_SNDBUF, &big_buf, sizeof(big_buf));
+    setsockopt(s_test, SOL_SOCKET, SO_RCVBUF, &big_buf, sizeof(big_buf));
 
-    std::set<Key> sent_set;
-    std::set<Key> recv_set;
-    std::mutex recv_mutex;
-    std::atomic<bool> sending_done{false};
+    int flags = fcntl(s_ref, F_GETFL, 0);
+    fcntl(s_ref, F_SETFL, flags | O_NONBLOCK);
+    flags = fcntl(s_test, F_GETFL, 0);
+    fcntl(s_test, F_SETFL, flags | O_NONBLOCK);
 
-    std::ofstream sent_cap("sent.cap");
-    std::ofstream recv_cap("recv.cap");
+    std::ofstream ref_send_log("ref_send.cap");
+    std::ofstream ref_recv_log("ref_recv.cap");
+    std::ofstream test_send_log("test_send.cap");
+    std::ofstream test_recv_log("test_recv.cap");
 
-    std::atomic<uint32_t> counter{0};
+    std::atomic<bool> running{true};
+    std::atomic<uint32_t> ref_counter{0}, test_counter{0};
+    std::atomic<size_t> stat_ref_sent{0}, stat_ref_recv{0}, stat_test_sent{0}, stat_test_recv{0};
 
-    // Прием в отдельном потоке
-    std::thread recv_thread([&]() {
-        auto last_receive_time = std::chrono::steady_clock::now();
-        const auto timeout = std::chrono::seconds(5);
+    std::thread t_send_ref(sender, s_ref, std::ref(ref_send_log), std::ref(running), if_ref, id_type, std::ref(ref_counter), std::ref(stat_ref_sent));
+    std::thread t_recv_ref(receiver, s_ref, std::ref(ref_recv_log), std::ref(running), if_ref, std::ref(stat_ref_recv), std::ref(stat_test_sent));
+    std::thread t_send_test(sender, s_test, std::ref(test_send_log), std::ref(running), if_test, id_type, std::ref(test_counter), std::ref(stat_test_sent));
+    std::thread t_recv_test(receiver, s_test, std::ref(test_recv_log), std::ref(running), if_test, std::ref(stat_test_recv), std::ref(stat_ref_sent));
 
-        while (!sending_done.load() || recv_set.size() < sent_set.size()) {
-            struct can_frame frame{};
-            int n = read(s_recv, &frame, sizeof(frame));
-            if (n == sizeof(frame)) {
-                Key k{frame.can_id, frame.data[0]};
-                {
-                    std::lock_guard<std::mutex> lock(recv_mutex);
-                    recv_set.insert(k);
-                }
-                write_cap_line(recv_cap, if_test.c_str(), frame);
-                last_receive_time = std::chrono::steady_clock::now(); // Обновляем время
-            } else {
-                if (sending_done.load()) {
-                    auto now = std::chrono::steady_clock::now();
-                    if (now - last_receive_time > timeout) {
-                        std::cout << "Таймаут: фреймы не поступают более " << timeout.count() << " секунд.\n";
-                        break;
-                    }
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
-        }
-    });
+    std::this_thread::sleep_for(std::chrono::seconds(seconds));
+    running = false;
 
-    // Отправка
-    auto start = std::chrono::steady_clock::now();
-    auto end = start + std::chrono::seconds(seconds);
+    t_send_ref.join();
+    t_recv_ref.join();
+    t_send_test.join();
+    t_recv_test.join();
 
-    while (std::chrono::steady_clock::now() < end) {
-        struct can_frame frame{};
-        frame.can_id = random_id(id_type);
-        frame.can_dlc = random_len();
-        frame.data[0] = (counter++) & 0xFF; // сквозной счетчик
-        for (int b = 1; b < frame.can_dlc; ++b)
-            frame.data[b] = std::uniform_int_distribution<uint8_t>(0, 255)(gen);
-
-        int n = write(s_send, &frame, sizeof(frame));
-        if (n == sizeof(frame)) {
-            sent_set.insert({frame.can_id, frame.data[0]});
-            write_cap_line(sent_cap, if_ref.c_str(), frame);
-        }
-        if (!max_mode) {
-            std::this_thread::sleep_for(std::chrono::microseconds(1000000 / msg_per_sec));
-        }
-    }
-    sending_done = true;
-    close(s_send);
-
-    recv_thread.join();
-    close(s_recv);
-    sent_cap.close();
-    recv_cap.close();
-
-    // Анализ
-    size_t sent = sent_set.size();
-    size_t received;
-    {
-        std::lock_guard<std::mutex> lock(recv_mutex);
-        received = recv_set.size();
-    }
-    size_t lost = 0;
-    for (const auto &k: sent_set)
-        if (recv_set.count(k) == 0) lost++;
-
-    size_t extras = 0;
-    for (const auto &k: recv_set)
-        if (sent_set.count(k) == 0) extras++;
+    close(s_ref);
+    close(s_test);
+    ref_send_log.close();
+    ref_recv_log.close();
+    test_send_log.close();
+    test_recv_log.close();
 
     std::cout << "===== Тест завершен =====\n";
-    std::cout << "Время теста: " << seconds << " сек\n";
-    std::cout << "Фактически отправлено: " << sent << "\n";
-    std::cout << "Фактически принято: " << received << "\n";
-    std::cout << "Потеряно: " << lost << "\n";
-    std::cout << "Изменено: " << extras << "\n";
-
+    std::cout << "Интерфейс " << if_ref << " отправил: " << stat_ref_sent
+              << " (" << (stat_ref_sent / seconds) << " в сек), получил: " << stat_ref_recv
+              << " (" << (stat_ref_recv / seconds) << " в сек)\n";
+    std::cout << "Интерфейс " << if_test << " отправил: " << stat_test_sent
+              << " (" << (stat_test_sent / seconds) << " в сек), получил: " << stat_test_recv
+              << " (" << (stat_test_recv / seconds) << " в сек)\n";
     return 0;
 }
