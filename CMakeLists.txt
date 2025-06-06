@@ -31,5 +31,5 @@ else ()
 endif ()
 
 if (FALSE)
-    target_link_options(cppCanTester PRIVATE -static)
+    target_link_options(cppCanTester PRIVATE -static -static-libgcc -static-libstdc++)
 endif ()
