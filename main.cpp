@@ -203,8 +203,16 @@ std::map<std::string, std::string> parse_args(int argc, char *argv[]) {
 int main(int argc, char *argv[]) {
     if (argc < 3) {
         std::cout << "Usage: " << argv[0]
-                  << " if_ref=can0 if_test=can2 [id_type=short|long|mix] [duplex_mode=duplex|full_duplex] [msg_per_sec=int|max] [sec=int] [diff_mode=show|hide] [save_mode=save|no_save]\n";
-        std::cout << "\nExample: " << argv[0] << " can0 can2\n";
+                  << " if_ref=<interface_name> if_test=<interface_name> [id_type=short|long|mix] [duplex_mode=duplex|full_duplex] [msg_per_sec=int|max] [sec=int] [diff_mode=show|hide] [save_mode=save|no_save]\n";
+        std::cout << "\nExample: " << argv[0] << " if_ref=can0 if_test=can2\n";
+
+        std::cout << "\nDefault values for optional arguments:\n"
+                  << "  id_type      = mix\n"
+                  << "  duplex_mode  = duplex\n"
+                  << "  msg_per_sec  = max\n"
+                  << "  sec          = 1\n"
+                  << "  diff_mode    = hide\n"
+                  << "  save_mode    = no_save\n";
         return 1;
     }
     auto args = parse_args(argc, argv);
