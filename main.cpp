@@ -324,16 +324,26 @@ int main(int argc, char *argv[]) {
 
     std::cout << "### Test results ###\n\n";
 
-    compare_messages(if_ref, if_test, ref_sent_messages, test_received_messages, diff_mode, seconds);
-    std::cout << std::endl;
-    compare_messages(if_test, if_ref, test_sent_messages, ref_received_messages, diff_mode, seconds);
+    if (!ref_sent_messages.empty() || !test_received_messages.empty())
+        compare_messages(if_ref, if_test, ref_sent_messages, test_received_messages, diff_mode, seconds);
+
+    if ((!ref_sent_messages.empty() || !test_received_messages.empty()) && (!test_sent_messages.empty() || !ref_received_messages.empty()))
+        std::cout << std::endl;
+
+    if (!test_sent_messages.empty() || !ref_received_messages.empty())
+        compare_messages(if_test, if_ref, test_sent_messages, ref_received_messages, diff_mode, seconds);
+
 
     if (save_mode == "save") {
-        save_messages_to_cap(if_ref, "sent.cap", ref_sent_messages);
-        save_messages_to_cap(if_ref, "received.cap", ref_received_messages);
+        if (!ref_sent_messages.empty())
+            save_messages_to_cap(if_ref, "sent.cap", ref_sent_messages);
+        if (!ref_received_messages.empty())
+            save_messages_to_cap(if_ref, "received.cap", ref_received_messages);
 
-        save_messages_to_cap(if_test, "sent.cap", test_sent_messages);
-        save_messages_to_cap(if_test, "received.cap", test_received_messages);
+        if (!test_sent_messages.empty())
+            save_messages_to_cap(if_test, "sent.cap", test_sent_messages);
+        if (!test_received_messages.empty())
+            save_messages_to_cap(if_test, "received.cap", test_received_messages);
     }
 
     return 0;
