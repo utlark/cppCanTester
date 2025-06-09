@@ -120,8 +120,7 @@ void receiver(int sock, std::atomic<bool> &running, std::atomic<size_t> &stat_re
     }
 }
 
-void compare_messages(const std::string &if_sent, const std::string &if_rec, const std::vector<MessageBox> &sent, const std::vector<MessageBox> &received,
-                      const std::string &diff_mode, int seconds) {
+void compare_messages(const std::string &if_sent, const std::string &if_rec, const std::vector<MessageBox> &sent, const std::vector<MessageBox> &received, int seconds) {
     uint32_t id_sent;
     uint32_t id_recv;
     bool all_match = true;
@@ -143,11 +142,7 @@ void compare_messages(const std::string &if_sent, const std::string &if_rec, con
 
         if (id_sent != id_recv || sent[i].frame.data[0] != received[i].frame.data[0]) {
             all_match = false;
-            if (diff_mode == "show") {
-                std::cout << "- Mismatch in position " << i << ": sent (ID: " << std::hex << id_sent
-                          << ", data[0]: " << std::dec << (int) sent[i].frame.data[0] << "), received (ID: " << std::hex << id_recv
-                          << ", data[0]: " << std::dec << (int) received[i].frame.data[0] << ")\n";
-            }
+            break;
         }
     }
 
@@ -161,6 +156,8 @@ void compare_messages(const std::string &if_sent, const std::string &if_rec, con
 
     if (all_match)
         std::cout << "All messages match in content and order.\n";
+    else
+        std::cout << "The messages don't match in content and/or order.\n";
 }
 
 void save_messages_to_cap(const std::string &ifname, const std::string &filename, const std::vector<MessageBox> &messages) {
@@ -203,7 +200,7 @@ std::map<std::string, std::string> parse_args(int argc, char *argv[]) {
 int main(int argc, char *argv[]) {
     if (argc < 3) {
         std::cout << "Usage: " << argv[0]
-                  << " if_ref=<interface_name> if_test=<interface_name> [id_type=short|long|mix] [duplex_mode=duplex|full_duplex] [msg_per_sec=int|max] [sec=int] [diff_mode=show|hide] [save_mode=save|no_save]\n";
+                  << " if_ref=<interface_name> if_test=<interface_name> [id_type=short|long|mix] [duplex_mode=full_duplex|duplex] [msg_per_sec=int|max] [sec=int] [save_mode=save|no_save]\n";
         std::cout << "\nExample: " << argv[0] << " if_ref=can0 if_test=can2\n";
 
         std::cout << "\nDefault values for optional arguments:\n"
@@ -211,7 +208,6 @@ int main(int argc, char *argv[]) {
                   << "  duplex_mode  = duplex\n"
                   << "  msg_per_sec  = max\n"
                   << "  sec          = 1\n"
-                  << "  diff_mode    = hide\n"
                   << "  save_mode    = no_save\n";
         return 1;
     }
@@ -230,7 +226,6 @@ int main(int argc, char *argv[]) {
     std::string duplex_mode = args.count("duplex_mode") ? args["duplex_mode"] : "duplex";
     std::string msg_per_sec_str = args.count("msg_per_sec") ? args["msg_per_sec"] : "max";
     int seconds = args.count("sec") ? std::stoi(args["sec"]) : 1;
-    std::string diff_mode = args.count("diff_mode") ? args["diff_mode"] : "hide";
     std::string save_mode = args.count("save_mode") ? args["save_mode"] : "no_save";
 
     if (!(id_type == "short" || id_type == "long" || id_type == "mix")) {
@@ -257,11 +252,6 @@ int main(int argc, char *argv[]) {
             std::cerr << "Invalid msg_per_sec. It must be an integer or 'max'\n";
             return 1;
         }
-
-    if (!(diff_mode == "show" || diff_mode == "hide")) {
-        std::cerr << "Invalid diff_mode. It must be 'show', or 'hide'.\n";
-        return 1;
-    }
 
     if (!(save_mode == "save" || save_mode == "no_save")) {
         std::cerr << "Invalid save_mode. It must be 'save', or 'no_save'.\n";
@@ -325,13 +315,13 @@ int main(int argc, char *argv[]) {
     std::cout << "### Test results ###\n\n";
 
     if (!ref_sent_messages.empty() || !test_received_messages.empty())
-        compare_messages(if_ref, if_test, ref_sent_messages, test_received_messages, diff_mode, seconds);
+        compare_messages(if_ref, if_test, ref_sent_messages, test_received_messages, seconds);
 
     if ((!ref_sent_messages.empty() || !test_received_messages.empty()) && (!test_sent_messages.empty() || !ref_received_messages.empty()))
         std::cout << std::endl;
 
     if (!test_sent_messages.empty() || !ref_received_messages.empty())
-        compare_messages(if_test, if_ref, test_sent_messages, ref_received_messages, diff_mode, seconds);
+        compare_messages(if_test, if_ref, test_sent_messages, ref_received_messages, seconds);
 
 
     if (save_mode == "save") {
