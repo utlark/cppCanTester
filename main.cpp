@@ -121,9 +121,9 @@ void receiver(int sock, std::atomic<bool> &running, std::atomic<size_t> &stat_re
 }
 
 void compare_messages(const std::string &if_sent, const std::string &if_rec, const std::vector<MessageBox> &sent, const std::vector<MessageBox> &received, int seconds) {
+    bool all_match = true;
     uint32_t id_sent;
     uint32_t id_recv;
-    bool all_match = true;
 
     std::cout << "#### " << if_sent << " -> " << if_rec << " ####\n";
     std::cout << "Sent:     " << sent.size() << " (" << std::floor(sent.size() / seconds) << "/s)" << "\n";
@@ -140,10 +140,16 @@ void compare_messages(const std::string &if_sent, const std::string &if_rec, con
         else
             id_recv = received[i].frame.can_id & CAN_SFF_MASK;
 
-        if (id_sent != id_recv || sent[i].frame.data[0] != received[i].frame.data[0]) {
+        if (id_sent != id_recv || sent[i].frame.can_dlc != received[i].frame.can_dlc) {
             all_match = false;
             break;
         }
+
+        for (int j = 0; j < sent[i].frame.can_dlc; ++j)
+            if (sent[i].frame.data[j] != received[i].frame.data[j]) {
+                all_match = false;
+                break;
+            }
     }
 
     if (sent.size() > received.size()) {
