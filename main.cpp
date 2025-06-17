@@ -13,9 +13,6 @@
 #include <sys/time.h>
 #include <map>
 
-std::random_device rd;
-std::mt19937 gen(rd());
-
 std::uniform_int_distribution<uint32_t> dis_short_id(0, 0x7FF);
 std::uniform_int_distribution<uint32_t> dis_long_id(0, 0x1FFFFFFF);
 std::uniform_int_distribution<int> dis_id_type(0, 1);
@@ -56,7 +53,7 @@ int open_can_socket(const std::string &ifname) {
     return s;
 }
 
-uint32_t random_id(const std::string &id_type) {
+uint32_t random_id(const std::string &id_type, std::mt19937 &gen) {
     if (id_type == "short")
         return dis_short_id(gen);
     else if (id_type == "long")
@@ -65,7 +62,8 @@ uint32_t random_id(const std::string &id_type) {
         return dis_id_type(gen) ? dis_short_id(gen) : dis_long_id(gen) | CAN_EFF_FLAG;
 }
 
-void sender(int sock, std::atomic<bool> &running, const std::string &id_type, std::atomic<size_t> &stat_sent, std::vector<MessageBox> &sent_messages, int msg_per_sec) {
+void sender(int sock, std::atomic<bool> &running, const std::string &id_type, std::atomic<size_t> &stat_sent, std::vector<MessageBox> &sent_messages, int msg_per_sec,
+            std::mt19937 &gen) {
     std::chrono::microseconds delay = (msg_per_sec > 0) ? std::chrono::microseconds(1000000 / msg_per_sec) : std::chrono::microseconds(0);
     auto next_send_time = std::chrono::steady_clock::now();
     uint8_t counter = 0;
@@ -74,7 +72,7 @@ void sender(int sock, std::atomic<bool> &running, const std::string &id_type, st
     while (running) {
         struct can_frame frame{};
 
-        frame.can_id = random_id(id_type);
+        frame.can_id = random_id(id_type, gen);
         frame.can_dlc = dis_can_dlc(gen);
         frame.data[0] = (counter++) & 0xFF;
         for (int b = 1; b < frame.can_dlc; ++b)
@@ -94,9 +92,10 @@ void sender(int sock, std::atomic<bool> &running, const std::string &id_type, st
     }
 }
 
-void receiver(int sock, std::atomic<bool> &running, std::atomic<size_t> &stat_recv, const std::atomic<size_t> &stat_sent, std::vector<MessageBox> &received_messages) {
+void receiver(int sock, std::atomic<bool> &running, std::atomic<size_t> &stat_recv, const std::atomic<size_t> &stat_sent, std::vector<MessageBox> &received_messages,
+              int timeout_sec) {
     auto last_receive_time = std::chrono::steady_clock::now();
-    const auto timeout = std::chrono::seconds(30);
+    const auto timeout = std::chrono::seconds(timeout_sec);
     struct timeval tv{};
 
     while (true) {
@@ -166,8 +165,8 @@ void compare_messages(const std::string &if_sent, const std::string &if_rec, con
         std::cout << "The messages don't match in content and/or order.\n";
 }
 
-void save_messages_to_cap(const std::string &ifname, const std::string &filename, const std::vector<MessageBox> &messages) {
-    std::ofstream f(ifname + "_" + filename);
+void save_messages_to_cap(const std::string &ifname, const std::string &filename, const std::vector<MessageBox> &messages, const std::string &seed_str) {
+    std::ofstream f(ifname + "_seed_" + seed_str + "_" + filename);
     if (!f.is_open())
         return;
 
@@ -206,7 +205,7 @@ std::map<std::string, std::string> parse_args(int argc, char *argv[]) {
 int main(int argc, char *argv[]) {
     if (argc < 3) {
         std::cout << "Usage: " << argv[0]
-                  << " if_ref=<interface_name> if_test=<interface_name> [id_type=short|long|mix] [duplex_mode=full_duplex|duplex] [msg_per_sec=int|max] [sec=int] [save_mode=save|no_save]\n";
+                  << " if_ref=<interface_name> if_test=<interface_name> [id_type=short|long|mix] [duplex_mode=full_duplex|duplex] [msg_per_sec=int|max] [sec=int] [save_mode=save|no_save] [seed=int|random] [timeout_sec=int]\n";
         std::cout << "\nExample: " << argv[0] << " if_ref=can0 if_test=can2\n";
 
         std::cout << "\nDefault values for optional arguments:\n"
@@ -214,14 +213,16 @@ int main(int argc, char *argv[]) {
                   << "  duplex_mode  = duplex\n"
                   << "  msg_per_sec  = max\n"
                   << "  sec          = 1\n"
-                  << "  save_mode    = no_save\n";
+                  << "  save_mode    = no_save\n"
+                  << "  seed         = random\n"
+                  << "  timeout_sec  = 15\n";
         return 1;
     }
     auto args = parse_args(argc, argv);
 
     if (!args.count("if_ref") || !args.count("if_test")) {
         std::cerr << "Error: 'if_ref' and 'if_test' are required.\n";
-        std::cout << "\nExample: " << argv[0] << " can0 can2\n";
+        std::cout << "\nExample: " << argv[0] << " if_ref=can0 if_test=can2\n";
         return 1;
     }
 
@@ -233,14 +234,16 @@ int main(int argc, char *argv[]) {
     std::string msg_per_sec_str = args.count("msg_per_sec") ? args["msg_per_sec"] : "max";
     int seconds = args.count("sec") ? std::stoi(args["sec"]) : 1;
     std::string save_mode = args.count("save_mode") ? args["save_mode"] : "no_save";
+    std::string seed_str = args.count("seed") ? args["seed"] : "random";
+    int timeout_sec = args.count("timeout_sec") ? std::stoi(args["timeout_sec"]) : 15;
 
     if (!(id_type == "short" || id_type == "long" || id_type == "mix")) {
-        std::cerr << "Invalid id_type. It must be 'short', 'long', or 'mix'.\n";
+        std::cerr << "Invalid 'id_type'. It must be 'short', 'long', or 'mix'.\n";
         return 1;
     }
 
     if (!(duplex_mode == "duplex" || duplex_mode == "full_duplex")) {
-        std::cerr << "Invalid duplex_mode. It must be 'duplex' or 'full_duplex'\n";
+        std::cerr << "Invalid 'duplex_mode'. It must be 'duplex' or 'full_duplex'\n";
         return 1;
     }
 
@@ -251,18 +254,37 @@ int main(int argc, char *argv[]) {
         try {
             msg_per_sec = std::stoi(msg_per_sec_str);
             if (msg_per_sec <= 0) {
-                std::cerr << "msg_per_sec must be a positive number or 'max'\n";
+                std::cerr << "'msg_per_sec' must be a positive number or 'max'\n";
                 return 1;
             }
         } catch (const std::invalid_argument &) {
-            std::cerr << "Invalid msg_per_sec. It must be an integer or 'max'\n";
+            std::cerr << "Invalid 'msg_per_sec'. It must be an integer or 'max'\n";
             return 1;
         }
 
     if (!(save_mode == "save" || save_mode == "no_save")) {
-        std::cerr << "Invalid save_mode. It must be 'save', or 'no_save'.\n";
+        std::cerr << "Invalid 'save_mode'. It must be 'save', or 'no_save'.\n";
         return 1;
     }
+
+    std::random_device rd_ref;
+    std::mt19937 gen_ref(rd_ref());
+
+    std::random_device rd_test;
+    std::mt19937 gen_test(rd_test());
+    if (seed_str != "random")
+        try {
+            int seed = std::stoi(seed_str);
+            if (seed <= 0) {
+                std::cerr << "'seed' must be a positive number or 'random'\n";
+                return 1;
+            }
+            gen_ref.seed(seed);
+            gen_test.seed(seed + 1);
+        } catch (const std::invalid_argument &) {
+            std::cerr << "Invalid 'seed'. It must be an integer or 'random'\n";
+            return 1;
+        }
 
     int s_ref = open_can_socket(if_ref);
     int s_test = open_can_socket(if_test);
@@ -287,18 +309,17 @@ int main(int argc, char *argv[]) {
     std::thread t_send_ref, t_recv_test, t_send_test, t_recv_ref;
 
     if (duplex_mode == "full_duplex") {
-        t_recv_ref = std::thread(receiver, s_ref, std::ref(running), std::ref(stat_ref_recv), std::ref(stat_test_sent), std::ref(ref_received_messages));
-        t_recv_test = std::thread(receiver, s_test, std::ref(running), std::ref(stat_test_recv), std::ref(stat_ref_sent), std::ref(test_received_messages));
+        t_recv_ref = std::thread(receiver, s_ref, std::ref(running), std::ref(stat_ref_recv), std::ref(stat_test_sent), std::ref(ref_received_messages), timeout_sec);
+        t_recv_test = std::thread(receiver, s_test, std::ref(running), std::ref(stat_test_recv), std::ref(stat_ref_sent), std::ref(test_received_messages), timeout_sec);
 
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-        t_send_ref = std::thread(sender, s_ref, std::ref(running), id_type, std::ref(stat_ref_sent), std::ref(ref_sent_messages), msg_per_sec);
-        t_send_test = std::thread(sender, s_test, std::ref(running), id_type, std::ref(stat_test_sent), std::ref(test_sent_messages), msg_per_sec);
-
+        t_send_ref = std::thread(sender, s_ref, std::ref(running), id_type, std::ref(stat_ref_sent), std::ref(ref_sent_messages), msg_per_sec, std::ref(gen_ref));
+        t_send_test = std::thread(sender, s_test, std::ref(running), id_type, std::ref(stat_test_sent), std::ref(test_sent_messages), msg_per_sec, std::ref(gen_test));
     } else {
-        t_recv_test = std::thread(receiver, s_test, std::ref(running), std::ref(stat_test_recv), std::ref(stat_ref_sent), std::ref(test_received_messages));
+        t_recv_test = std::thread(receiver, s_test, std::ref(running), std::ref(stat_test_recv), std::ref(stat_ref_sent), std::ref(test_received_messages), timeout_sec);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        t_send_ref = std::thread(sender, s_ref, std::ref(running), id_type, std::ref(stat_ref_sent), std::ref(ref_sent_messages), msg_per_sec);
+        t_send_ref = std::thread(sender, s_ref, std::ref(running), id_type, std::ref(stat_ref_sent), std::ref(ref_sent_messages), msg_per_sec, std::ref(gen_ref));
     }
 
     std::this_thread::sleep_for(std::chrono::seconds(seconds));
@@ -332,14 +353,14 @@ int main(int argc, char *argv[]) {
 
     if (save_mode == "save") {
         if (!ref_sent_messages.empty())
-            save_messages_to_cap(if_ref, "sent.cap", ref_sent_messages);
+            save_messages_to_cap(if_ref, "sent.cap", ref_sent_messages, seed_str);
         if (!ref_received_messages.empty())
-            save_messages_to_cap(if_ref, "received.cap", ref_received_messages);
+            save_messages_to_cap(if_ref, "received.cap", ref_received_messages, seed_str);
 
         if (!test_sent_messages.empty())
-            save_messages_to_cap(if_test, "sent.cap", test_sent_messages);
+            save_messages_to_cap(if_test, "sent.cap", test_sent_messages, seed_str);
         if (!test_received_messages.empty())
-            save_messages_to_cap(if_test, "received.cap", test_received_messages);
+            save_messages_to_cap(if_test, "received.cap", test_received_messages, seed_str);
     }
 
     return 0;
