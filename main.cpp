@@ -66,23 +66,29 @@ void sender(int sock, std::atomic<bool> &running, const std::string &id_type, st
             std::mt19937 &gen) {
     std::chrono::microseconds delay = (msg_per_sec > 0) ? std::chrono::microseconds(1000000 / msg_per_sec) : std::chrono::microseconds(0);
     auto next_send_time = std::chrono::steady_clock::now();
-    uint8_t counter = 0;
+    struct can_frame frame{};
     struct timeval tv{};
+    uint8_t counter = 0;
+
+    frame.can_id = random_id(id_type, gen);
+    frame.can_dlc = dis_can_dlc(gen);
+    frame.data[0] = (counter++) & 0xFF;
+    for (int b = 1; b < frame.can_dlc; ++b)
+        frame.data[b] = dis_can_data(gen);
 
     while (running) {
-        struct can_frame frame{};
-
-        frame.can_id = random_id(id_type, gen);
-        frame.can_dlc = dis_can_dlc(gen);
-        frame.data[0] = (counter++) & 0xFF;
-        for (int b = 1; b < frame.can_dlc; ++b)
-            frame.data[b] = dis_can_data(gen);
-
         ssize_t n = write(sock, &frame, sizeof(frame));
         if (n == sizeof(frame)) {
             gettimeofday(&tv, nullptr);
             sent_messages.push_back({frame, tv});
             ++stat_sent;
+
+            std::memset(&frame, 0, sizeof(frame));
+            frame.can_id = random_id(id_type, gen);
+            frame.can_dlc = dis_can_dlc(gen);
+            frame.data[0] = (counter++) & 0xFF;
+            for (int b = 1; b < frame.can_dlc; ++b)
+                frame.data[b] = dis_can_data(gen);
         }
 
         if (msg_per_sec > 0) {
