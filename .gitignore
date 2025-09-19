@@ -1,4 +1,5 @@
 /cmake-build-*/
+/Toolchains/
 ~$*
 ~*.tmp
 .~lock*
