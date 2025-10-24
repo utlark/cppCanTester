@@ -1,372 +1,365 @@
-#include <iostream>
+#include <atomic>
+#include <fcntl.h>
 #include <fstream>
+#include <iostream>
 #include <linux/can.h>
 #include <net/if.h>
-#include <sys/ioctl.h>
-#include <unistd.h>
-#include <cstring>
 #include <random>
-#include <thread>
-#include <atomic>
-#include <iomanip>
-#include <fcntl.h>
+#include <sys/ioctl.h>
 #include <sys/time.h>
-#include <map>
+#include <thread>
+#include <unistd.h>
 
-std::uniform_int_distribution<uint32_t> dis_short_id(0, 0x7FF);
-std::uniform_int_distribution<uint32_t> dis_long_id(0, 0x1FFFFFFF);
-std::uniform_int_distribution<int> dis_id_type(0, 1);
-
-std::uniform_int_distribution<uint8_t> dis_can_dlc(1, 8);
-std::uniform_int_distribution<uint8_t> dis_can_data(0, 255);
+#include "cxxopts.hpp"
 
 struct MessageBox {
     can_frame frame;
     timeval time;
 };
 
-int open_can_socket(const std::string &ifname) {
-    int s = socket(PF_CAN, SOCK_RAW, CAN_RAW);
+struct Config {
+    std::string referenceInterface;
+    std::string testedInterface;
+    std::string idType = "mix";
+    std::string duplexMode = "duplex";
+    int msgPerSec = -1;
+    int seconds = 1;
+    std::string saveMode = "no_save";
+    std::string seedStr = "random";
+    int timeoutSec = 15;
+};
 
-    if (s < 0) {
-        perror("socket");
-        return -1;
+Config appConfig{};
+std::atomic<bool> shutdownRequested{false};
+
+std::uniform_int_distribution<uint32_t> disShortId(0, 0x7FF);
+std::uniform_int_distribution<uint32_t> disLongId(0, 0x1FFFFFFF);
+std::uniform_int_distribution<int> disIdType(0, 1);
+
+std::uniform_int_distribution<uint8_t> disCanDlc(1, 8);
+std::uniform_int_distribution<uint8_t> disCanData(0, 255);
+
+int OpenCanSocket(const std::string &interfaceName) {
+    int socketFd = socket(PF_CAN, SOCK_RAW, CAN_RAW);
+    if (socketFd < 0)
+        throw std::system_error(errno, std::system_category(), "Failed to create CAN socket device: " + interfaceName);
+
+    struct ifreq interfaceRequest{};
+    std::strncpy(interfaceRequest.ifr_name, interfaceName.c_str(), IFNAMSIZ - 1);
+    if (ioctl(socketFd, SIOCGIFINDEX, &interfaceRequest) < 0) {
+        close(socketFd);
+        throw std::system_error(errno, std::system_category(), "Failed to open CAN socket device: " + interfaceName);
     }
 
-    struct ifreq ifr{};
-    std::strncpy(ifr.ifr_name, ifname.c_str(), IFNAMSIZ - 1);
-    if (ioctl(s, SIOCGIFINDEX, &ifr) < 0) {
-        perror("ioctl");
-        close(s);
-        return -1;
+    struct sockaddr_can socketAddress{};
+    socketAddress.can_family = AF_CAN;
+    socketAddress.can_ifindex = interfaceRequest.ifr_ifindex;
+    if (bind(socketFd, (struct sockaddr *) &socketAddress, sizeof(socketAddress)) < 0) {
+        close(socketFd);
+        throw std::system_error(errno, std::system_category(), "Failed to bind CAN socket device: " + interfaceName);
     }
 
-    struct sockaddr_can addr{};
-    addr.can_family = AF_CAN;
-    addr.can_ifindex = ifr.ifr_ifindex;
-    if (bind(s, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
-        perror("bind");
-        close(s);
-        return -1;
-    }
-
-    return s;
+    return socketFd;
 }
 
-uint32_t random_id(const std::string &id_type, std::mt19937 &gen) {
-    if (id_type == "short")
-        return dis_short_id(gen);
-    else if (id_type == "long")
-        return dis_long_id(gen) | CAN_EFF_FLAG;
+uint32_t GetRandomId(const std::string &idType, std::mt19937 &rngGenerator) {
+    if (idType == "short")
+        return disShortId(rngGenerator);
+    else if (idType == "long")
+        return disLongId(rngGenerator) | CAN_EFF_FLAG;
     else
-        return dis_id_type(gen) ? dis_short_id(gen) : dis_long_id(gen) | CAN_EFF_FLAG;
+        return disIdType(rngGenerator) ? disShortId(rngGenerator) : disLongId(rngGenerator) | CAN_EFF_FLAG;
 }
 
-void sender(int sock, std::atomic<bool> &running, const std::string &id_type, std::atomic<size_t> &stat_sent, std::vector<MessageBox> &sent_messages, int msg_per_sec,
-            std::mt19937 &gen) {
-    std::chrono::microseconds delay = (msg_per_sec > 0) ? std::chrono::microseconds(1000000 / msg_per_sec) : std::chrono::microseconds(0);
-    auto next_send_time = std::chrono::steady_clock::now();
-    struct can_frame frame{};
-    struct timeval tv{};
+void SenderLoop(int socketFd, std::atomic<size_t> &sentCounter, std::vector<MessageBox> &sentMessages, std::mt19937 &rngGenerator) {
+    std::chrono::microseconds sendDelay = (appConfig.msgPerSec > 0) ? std::chrono::microseconds(1000000 / appConfig.msgPerSec) : std::chrono::microseconds(0);
+    auto nextSendTime = std::chrono::steady_clock::now();
+    struct can_frame canFrame{};
+    struct timeval timeValue{};
     uint8_t counter = 0;
 
-    frame.can_id = random_id(id_type, gen);
-    frame.can_dlc = dis_can_dlc(gen);
-    frame.data[0] = (counter++) & 0xFF;
-    for (int b = 1; b < frame.can_dlc; ++b)
-        frame.data[b] = dis_can_data(gen);
+    canFrame.can_id = GetRandomId(appConfig.idType, rngGenerator);
+    canFrame.can_dlc = disCanDlc(rngGenerator);
+    canFrame.data[0] = (counter++) & 0xFF;
+    for (int i = 1; i < canFrame.can_dlc; ++i)
+        canFrame.data[i] = disCanData(rngGenerator);
 
-    while (running) {
-        ssize_t n = write(sock, &frame, sizeof(frame));
-        if (n == sizeof(frame)) {
-            gettimeofday(&tv, nullptr);
-            sent_messages.push_back({frame, tv});
-            ++stat_sent;
+    while (!shutdownRequested.load()) {
+        ssize_t n = write(socketFd, &canFrame, sizeof(canFrame));
+        if (n == sizeof(canFrame)) {
+            gettimeofday(&timeValue, nullptr);
+            sentMessages.push_back({canFrame, timeValue});
+            ++sentCounter;
 
-            std::memset(&frame, 0, sizeof(frame));
-            frame.can_id = random_id(id_type, gen);
-            frame.can_dlc = dis_can_dlc(gen);
-            frame.data[0] = (counter++) & 0xFF;
-            for (int b = 1; b < frame.can_dlc; ++b)
-                frame.data[b] = dis_can_data(gen);
+            std::memset(&canFrame, 0, sizeof(canFrame));
+            canFrame.can_id = GetRandomId(appConfig.idType, rngGenerator);
+            canFrame.can_dlc = disCanDlc(rngGenerator);
+            canFrame.data[0] = (counter++) & 0xFF;
+            for (int i = 1; i < canFrame.can_dlc; ++i)
+                canFrame.data[i] = disCanData(rngGenerator);
         }
 
-        if (msg_per_sec > 0) {
-            next_send_time += delay;
-            std::this_thread::sleep_until(next_send_time);
+        if (appConfig.msgPerSec > 0) {
+            nextSendTime += sendDelay;
+            std::this_thread::sleep_until(nextSendTime);
         }
     }
 }
 
-void receiver(int sock, std::atomic<bool> &running, std::atomic<size_t> &stat_recv, const std::atomic<size_t> &stat_sent, std::vector<MessageBox> &received_messages,
-              int timeout_sec) {
-    auto last_receive_time = std::chrono::steady_clock::now();
-    const auto timeout = std::chrono::seconds(timeout_sec);
-    struct timeval tv{};
+void ReceiverLoop(int socketFd, std::atomic<size_t> &receivedCounter, std::vector<MessageBox> &receivedMessages, const std::atomic<size_t> &sentCounter) {
+    auto lastReceiveTime = std::chrono::steady_clock::now();
+    const auto timeout = std::chrono::seconds(appConfig.timeoutSec);
+    struct timeval timeValue{};
 
     while (true) {
-        if (!running.load()) {
-            if (stat_recv.load() >= stat_sent.load())
+        if (shutdownRequested.load()) {
+            if (receivedCounter.load() >= sentCounter.load())
                 break;
-            if (std::chrono::steady_clock::now() - last_receive_time > timeout)
+            if (std::chrono::steady_clock::now() - lastReceiveTime > timeout)
                 break;
         }
 
-        struct can_frame frame{};
-        ssize_t n = read(sock, &frame, sizeof(frame));
-        if (n == sizeof(frame)) {
-            gettimeofday(&tv, nullptr);
-            received_messages.push_back({frame, tv});
-            last_receive_time = std::chrono::steady_clock::now();
-            ++stat_recv;
+        struct can_frame canFrame{};
+        ssize_t n = read(socketFd, &canFrame, sizeof(canFrame));
+        if (n == sizeof(canFrame)) {
+            gettimeofday(&timeValue, nullptr);
+            receivedMessages.push_back({canFrame, timeValue});
+            lastReceiveTime = std::chrono::steady_clock::now();
+            ++receivedCounter;
         } else {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
 }
 
-void compare_messages(const std::string &if_sent, const std::string &if_rec, const std::vector<MessageBox> &sent, const std::vector<MessageBox> &received, int seconds) {
-    bool all_match = true;
-    uint32_t id_sent;
-    uint32_t id_recv;
+void CompareMessages(const std::string &senderInterface, const std::string &receiveInterface,
+                     const std::vector<MessageBox> &sentMessages, const std::vector<MessageBox> &receivedMessages) {
+    bool allMatch = true;
+    uint32_t sentMessageId;
+    uint32_t receiveMessageId;
 
-    std::cout << "#### " << if_sent << " -> " << if_rec << " ####\n";
-    std::cout << "Sent:     " << sent.size() << " (" << std::floor(sent.size() / seconds) << "/s)" << "\n";
-    std::cout << "Received: " << received.size() << " (" << std::floor(received.size() / seconds) << "/s)" << "\n";
+    std::cout << "#### " << senderInterface << " -> " << receiveInterface << " ####\n";
+    std::cout << "Sent:     " << sentMessages.size() << " (" << std::floor(sentMessages.size() / appConfig.seconds) << "/s)" << "\n";
+    std::cout << "Received: " << receivedMessages.size() << " (" << std::floor(receivedMessages.size() / appConfig.seconds) << "/s)" << "\n";
 
-    for (size_t i = 0; i < std::min(sent.size(), received.size()); ++i) {
-        if (sent[i].frame.can_id & CAN_EFF_FLAG)
-            id_sent = sent[i].frame.can_id & CAN_EFF_MASK;
+    for (size_t i = 0; i < std::min(sentMessages.size(), receivedMessages.size()); ++i) {
+        if (sentMessages[i].frame.can_id & CAN_EFF_FLAG)
+            sentMessageId = sentMessages[i].frame.can_id & CAN_EFF_MASK;
         else
-            id_sent = sent[i].frame.can_id & CAN_SFF_MASK;
+            sentMessageId = sentMessages[i].frame.can_id & CAN_SFF_MASK;
 
-        if (received[i].frame.can_id & CAN_EFF_FLAG)
-            id_recv = received[i].frame.can_id & CAN_EFF_MASK;
+        if (receivedMessages[i].frame.can_id & CAN_EFF_FLAG)
+            receiveMessageId = receivedMessages[i].frame.can_id & CAN_EFF_MASK;
         else
-            id_recv = received[i].frame.can_id & CAN_SFF_MASK;
+            receiveMessageId = receivedMessages[i].frame.can_id & CAN_SFF_MASK;
 
-        if (id_sent != id_recv || sent[i].frame.can_dlc != received[i].frame.can_dlc) {
-            all_match = false;
+        if (sentMessageId != receiveMessageId || sentMessages[i].frame.can_dlc != receivedMessages[i].frame.can_dlc) {
+            allMatch = false;
             break;
         }
 
-        for (int j = 0; j < sent[i].frame.can_dlc; ++j)
-            if (sent[i].frame.data[j] != received[i].frame.data[j]) {
-                all_match = false;
+        for (int j = 0; j < sentMessages[i].frame.can_dlc; ++j)
+            if (sentMessages[i].frame.data[j] != receivedMessages[i].frame.data[j]) {
+                allMatch = false;
                 break;
             }
     }
 
-    if (sent.size() > received.size()) {
-        std::cout << "- Lost messages " << (sent.size() - received.size()) << "\n";
-        all_match = false;
-    } else if (received.size() > sent.size()) {
-        std::cout << "- Extra messages " << (received.size() - sent.size()) << "\n";
-        all_match = false;
+    if (sentMessages.size() > receivedMessages.size()) {
+        std::cout << "- Lost messages " << (sentMessages.size() - receivedMessages.size()) << "\n";
+        allMatch = false;
+    } else if (receivedMessages.size() > sentMessages.size()) {
+        std::cout << "- Extra messages " << (receivedMessages.size() - sentMessages.size()) << "\n";
+        allMatch = false;
     }
 
-    if (all_match)
+    if (allMatch)
         std::cout << "All messages match in content and order.\n";
     else
         std::cout << "The messages don't match in content and/or order.\n";
 }
 
-void save_messages_to_cap(const std::string &ifname, const std::string &filename, const std::vector<MessageBox> &messages, const std::string &seed_str) {
-    std::ofstream f(ifname + "_seed_" + seed_str + "_" + filename);
-    if (!f.is_open())
-        return;
+void SaveMessagesToCap(const std::string &interfaceName, const std::string &filename, const std::vector<MessageBox> &messages) {
+    std::ofstream saveStream(interfaceName + "_seed_" + appConfig.seedStr + "_" + filename);
+    if (!saveStream.is_open())
+        throw std::system_error(errno, std::system_category(), "Unable to open the file for saving: " + interfaceName + "_seed_" + appConfig.seedStr + "_" + filename);
 
     for (const auto &message: messages) {
-        f << "(" << std::setw(10) << std::setfill('0') << message.time.tv_sec << "."
-          << std::setw(6) << std::setfill('0') << message.time.tv_usec << ") "
-          << ifname << " ";
+        saveStream << "(" << std::setw(10) << std::setfill('0') << message.time.tv_sec << "."
+                   << std::setw(6) << std::setfill('0') << message.time.tv_usec << ") "
+                   << interfaceName << " ";
 
         if (message.frame.can_id & CAN_EFF_FLAG)
-            f << std::hex << std::uppercase << std::setw(8) << std::setfill('0') << (message.frame.can_id & CAN_EFF_MASK);
+            saveStream << std::hex << std::uppercase << std::setw(8) << std::setfill('0') << (message.frame.can_id & CAN_EFF_MASK);
         else
-            f << std::hex << std::uppercase << std::setw(3) << std::setfill('0') << (message.frame.can_id & CAN_SFF_MASK);
+            saveStream << std::hex << std::uppercase << std::setw(3) << std::setfill('0') << (message.frame.can_id & CAN_SFF_MASK);
 
-        f << "#";
-        f << std::hex << std::uppercase;
+        saveStream << "#";
+        saveStream << std::hex << std::uppercase;
         for (int i = 0; i < message.frame.can_dlc; ++i)
-            f << std::setw(2) << std::setfill('0') << (int) message.frame.data[i];
-        f << std::dec << "\n";
+            saveStream << std::setw(2) << std::setfill('0') << (int) message.frame.data[i];
+        saveStream << std::dec << "\n";
     }
 }
 
-std::map<std::string, std::string> parse_args(int argc, char *argv[]) {
-    std::map<std::string, std::string> args;
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        auto pos = arg.find('=');
-        if (pos != std::string::npos) {
-            std::string key = arg.substr(0, pos);
-            std::string value = arg.substr(pos + 1);
-            args[key] = value;
-        }
+void LoadConfig(int argc, char *argv[]) {
+    cxxopts::Options options(argv[0], "CAN interface tester\n");
+
+    options.add_options()
+            ("h,help", "Print usage")
+            ("if_ref", "Reference interface name", cxxopts::value<std::string>())
+            ("if_test", "Tested interface name", cxxopts::value<std::string>())
+            ("id_type", "ID type: short|long|mix", cxxopts::value<std::string>()->default_value("mix"))
+            ("duplex_mode", "Duplex mode: duplex|full_duplex", cxxopts::value<std::string>()->default_value("duplex"))
+            ("msg_per_sec", "Messages per second: int or max", cxxopts::value<std::string>()->default_value("max"))
+            ("sec", "Test duration in seconds", cxxopts::value<int>()->default_value("1"))
+            ("save_mode", "Save mode: save|no_save", cxxopts::value<std::string>()->default_value("no_save"))
+            ("seed", "Seed: int or random", cxxopts::value<std::string>()->default_value("random"))
+            ("timeout_sec", "Timeout in seconds", cxxopts::value<int>()->default_value("15"));
+
+    auto parse = options.parse(argc, argv);
+
+    if (parse.count("help")) {
+        std::cout << options.help() << std::endl;
+        std::cout << "\nExample: " << argv[0] << " --if_ref=can0 --if_test=can2" << std::endl;
+        exit(0);
     }
-    return args;
+
+    if (!parse.count("if_ref") || !parse.count("if_test")) {
+        std::cerr << "Error: '--if_ref' and '--if_test' are required.\n";
+        std::cout << options.help() << std::endl;
+        exit(1);
+    }
+
+    appConfig.referenceInterface = parse["if_ref"].as<std::string>();
+    appConfig.testedInterface = parse["if_test"].as<std::string>();
+    appConfig.idType = parse["id_type"].as<std::string>();
+    appConfig.duplexMode = parse["duplex_mode"].as<std::string>();
+    appConfig.seconds = parse["sec"].as<int>();
+    appConfig.saveMode = parse["save_mode"].as<std::string>();
+    appConfig.seedStr = parse["seed"].as<std::string>();
+    appConfig.timeoutSec = parse["timeout_sec"].as<int>();
+
+    if (!(appConfig.idType == "short" || appConfig.idType == "long" || appConfig.idType == "mix"))
+        throw std::invalid_argument("Invalid '--id_type'. It must be 'short', 'long', or 'mix'.\n");
+
+    if (!(appConfig.duplexMode == "duplex" || appConfig.duplexMode == "full_duplex"))
+        throw std::invalid_argument("Invalid '--duplex_mode'. It must be 'duplex' or 'full_duplex'.\n");
+
+    std::string msg_per_sec_str = parse["msg_per_sec"].as<std::string>();
+    if (msg_per_sec_str == "max")
+        appConfig.msgPerSec = -1;
+    else
+        try {
+            appConfig.msgPerSec = std::stoi(msg_per_sec_str);
+            if (appConfig.msgPerSec <= 0)
+                throw std::invalid_argument("Invalid '--msg_per_sec'. It must be a positive integer or 'max'\n");
+        } catch (...) {
+            throw std::invalid_argument("Invalid '--msg_per_sec'. It must be a positive integer or 'max'.\n");
+        }
+
+    if (!(appConfig.saveMode == "save" || appConfig.saveMode == "no_save"))
+        throw std::invalid_argument("Invalid '--save_mode'. It must be 'save' or 'no_save'.\n");
+
+    if (appConfig.seedStr != "random")
+        try {
+            int seed = std::stoi(appConfig.seedStr);
+            if (seed <= 0) {
+                throw std::invalid_argument("Invalid '--seed'. It must be a positive integer or 'random'.\n");
+            }
+        } catch (...) {
+            throw std::invalid_argument("Invalid '--seed'. It must be a positive integer or 'random'.\n");
+        }
 }
 
 int main(int argc, char *argv[]) {
-    if (argc < 3) {
-        std::cout << "Usage: " << argv[0]
-                  << " if_ref=<interface_name> if_test=<interface_name> [id_type=short|long|mix] [duplex_mode=full_duplex|duplex] [msg_per_sec=int|max] [sec=int] [save_mode=save|no_save] [seed=int|random] [timeout_sec=int]\n";
-        std::cout << "\nExample: " << argv[0] << " if_ref=can0 if_test=can2\n";
+    LoadConfig(argc, argv);
 
-        std::cout << "\nDefault values for optional arguments:\n"
-                  << "  id_type      = mix\n"
-                  << "  duplex_mode  = duplex\n"
-                  << "  msg_per_sec  = max\n"
-                  << "  sec          = 1\n"
-                  << "  save_mode    = no_save\n"
-                  << "  seed         = random\n"
-                  << "  timeout_sec  = 15\n";
-        return 1;
-    }
-    auto args = parse_args(argc, argv);
+    std::random_device rngDeviceForReference;
+    std::random_device rngDeviceForTested;
 
-    if (!args.count("if_ref") || !args.count("if_test")) {
-        std::cerr << "Error: 'if_ref' and 'if_test' are required.\n";
-        std::cout << "\nExample: " << argv[0] << " if_ref=can0 if_test=can2\n";
-        return 1;
+    std::mt19937 rngGeneratorForReference(rngDeviceForReference());
+    std::mt19937 rngGeneratorForTested(rngDeviceForTested());
+
+    if (appConfig.seedStr != "random") {
+        int seed = std::stoi(appConfig.seedStr);
+        rngGeneratorForReference.seed(seed);
+        rngGeneratorForTested.seed(seed + 1);
     }
 
-    std::string if_ref = args["if_ref"];
-    std::string if_test = args["if_test"];
+    int referenceSocket = OpenCanSocket(appConfig.referenceInterface);
+    int testedSocket = OpenCanSocket(appConfig.testedInterface);
 
-    std::string id_type = args.count("id_type") ? args["id_type"] : "mix";
-    std::string duplex_mode = args.count("duplex_mode") ? args["duplex_mode"] : "duplex";
-    std::string msg_per_sec_str = args.count("msg_per_sec") ? args["msg_per_sec"] : "max";
-    int seconds = args.count("sec") ? std::stoi(args["sec"]) : 1;
-    std::string save_mode = args.count("save_mode") ? args["save_mode"] : "no_save";
-    std::string seed_str = args.count("seed") ? args["seed"] : "random";
-    int timeout_sec = args.count("timeout_sec") ? std::stoi(args["timeout_sec"]) : 15;
+    int socketBuffer = 500000;
+    setsockopt(referenceSocket, SOL_SOCKET, SO_SNDBUF, &socketBuffer, sizeof(socketBuffer));
+    setsockopt(referenceSocket, SOL_SOCKET, SO_RCVBUF, &socketBuffer, sizeof(socketBuffer));
+    setsockopt(testedSocket, SOL_SOCKET, SO_SNDBUF, &socketBuffer, sizeof(socketBuffer));
+    setsockopt(testedSocket, SOL_SOCKET, SO_RCVBUF, &socketBuffer, sizeof(socketBuffer));
 
-    if (!(id_type == "short" || id_type == "long" || id_type == "mix")) {
-        std::cerr << "Invalid 'id_type'. It must be 'short', 'long', or 'mix'.\n";
-        return 1;
-    }
+    int flags = fcntl(referenceSocket, F_GETFL, 0);
+    fcntl(referenceSocket, F_SETFL, flags | O_NONBLOCK);
 
-    if (!(duplex_mode == "duplex" || duplex_mode == "full_duplex")) {
-        std::cerr << "Invalid 'duplex_mode'. It must be 'duplex' or 'full_duplex'\n";
-        return 1;
-    }
+    flags = fcntl(testedSocket, F_GETFL, 0);
+    fcntl(testedSocket, F_SETFL, flags | O_NONBLOCK);
 
-    int msg_per_sec = 0;
-    if (msg_per_sec_str == "max")
-        msg_per_sec = -1;
-    else
-        try {
-            msg_per_sec = std::stoi(msg_per_sec_str);
-            if (msg_per_sec <= 0) {
-                std::cerr << "'msg_per_sec' must be a positive number or 'max'\n";
-                return 1;
-            }
-        } catch (const std::invalid_argument &) {
-            std::cerr << "Invalid 'msg_per_sec'. It must be an integer or 'max'\n";
-            return 1;
-        }
+    std::thread referenceSentLoop{}, referenceReceivedLoop{}, testedSentLoop{}, testedReceivedLoop{};
+    std::atomic<size_t> referenceSentCounter{0}, referenceReceivedCounter{0}, testedSentCounter{0}, testedReceivedCounter{0};
+    std::vector<MessageBox> referenceSentMessages{}, referenceReceivedMessages{}, testedSentMessages{}, testedReceivedMessages{};
 
-    if (!(save_mode == "save" || save_mode == "no_save")) {
-        std::cerr << "Invalid 'save_mode'. It must be 'save', or 'no_save'.\n";
-        return 1;
-    }
-
-    std::random_device rd_ref;
-    std::mt19937 gen_ref(rd_ref());
-
-    std::random_device rd_test;
-    std::mt19937 gen_test(rd_test());
-    if (seed_str != "random")
-        try {
-            int seed = std::stoi(seed_str);
-            if (seed <= 0) {
-                std::cerr << "'seed' must be a positive number or 'random'\n";
-                return 1;
-            }
-            gen_ref.seed(seed);
-            gen_test.seed(seed + 1);
-        } catch (const std::invalid_argument &) {
-            std::cerr << "Invalid 'seed'. It must be an integer or 'random'\n";
-            return 1;
-        }
-
-    int s_ref = open_can_socket(if_ref);
-    int s_test = open_can_socket(if_test);
-    if (s_ref < 0 || s_test < 0)
-        return 1;
-
-    int big_buf = 500000;
-    setsockopt(s_ref, SOL_SOCKET, SO_SNDBUF, &big_buf, sizeof(big_buf));
-    setsockopt(s_ref, SOL_SOCKET, SO_RCVBUF, &big_buf, sizeof(big_buf));
-    setsockopt(s_test, SOL_SOCKET, SO_SNDBUF, &big_buf, sizeof(big_buf));
-    setsockopt(s_test, SOL_SOCKET, SO_RCVBUF, &big_buf, sizeof(big_buf));
-
-    int flags = fcntl(s_ref, F_GETFL, 0);
-    fcntl(s_ref, F_SETFL, flags | O_NONBLOCK);
-    flags = fcntl(s_test, F_GETFL, 0);
-    fcntl(s_test, F_SETFL, flags | O_NONBLOCK);
-
-    std::atomic<bool> running{true};
-    std::atomic<size_t> stat_ref_sent{0}, stat_ref_recv{0}, stat_test_sent{0}, stat_test_recv{0};
-    std::vector<MessageBox> ref_sent_messages, test_received_messages, test_sent_messages, ref_received_messages;
-
-    std::thread t_send_ref, t_recv_test, t_send_test, t_recv_ref;
-
-    if (duplex_mode == "full_duplex") {
-        t_recv_ref = std::thread(receiver, s_ref, std::ref(running), std::ref(stat_ref_recv), std::ref(stat_test_sent), std::ref(ref_received_messages), timeout_sec);
-        t_recv_test = std::thread(receiver, s_test, std::ref(running), std::ref(stat_test_recv), std::ref(stat_ref_sent), std::ref(test_received_messages), timeout_sec);
+    if (appConfig.duplexMode == "full_duplex") {
+        referenceReceivedLoop = std::thread(ReceiverLoop, referenceSocket, std::ref(referenceReceivedCounter), std::ref(referenceReceivedMessages), std::ref(testedSentCounter));
+        testedReceivedLoop = std::thread(ReceiverLoop, testedSocket, std::ref(testedReceivedCounter), std::ref(testedReceivedMessages), std::ref(referenceSentCounter));
 
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-        t_send_ref = std::thread(sender, s_ref, std::ref(running), id_type, std::ref(stat_ref_sent), std::ref(ref_sent_messages), msg_per_sec, std::ref(gen_ref));
-        t_send_test = std::thread(sender, s_test, std::ref(running), id_type, std::ref(stat_test_sent), std::ref(test_sent_messages), msg_per_sec, std::ref(gen_test));
+        referenceSentLoop = std::thread(SenderLoop, referenceSocket, std::ref(referenceSentCounter), std::ref(referenceSentMessages), std::ref(rngGeneratorForReference));
+        testedSentLoop = std::thread(SenderLoop, testedSocket, std::ref(testedSentCounter), std::ref(testedSentMessages), std::ref(rngGeneratorForTested));
     } else {
-        t_recv_test = std::thread(receiver, s_test, std::ref(running), std::ref(stat_test_recv), std::ref(stat_ref_sent), std::ref(test_received_messages), timeout_sec);
+        testedReceivedLoop = std::thread(ReceiverLoop, testedSocket, std::ref(testedReceivedCounter), std::ref(testedReceivedMessages), std::ref(referenceSentCounter));
+
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        t_send_ref = std::thread(sender, s_ref, std::ref(running), id_type, std::ref(stat_ref_sent), std::ref(ref_sent_messages), msg_per_sec, std::ref(gen_ref));
+
+        referenceSentLoop = std::thread(SenderLoop, referenceSocket, std::ref(referenceSentCounter), std::ref(referenceSentMessages), std::ref(rngGeneratorForReference));
     }
 
-    std::this_thread::sleep_for(std::chrono::seconds(seconds));
-    running = false;
+    std::this_thread::sleep_for(std::chrono::seconds(appConfig.seconds));
+    shutdownRequested.store(true);
 
-    if (duplex_mode == "full_duplex") {
-        t_send_ref.join();
-        t_recv_test.join();
+    if (appConfig.duplexMode == "full_duplex") {
+        referenceSentLoop.join();
+        testedReceivedLoop.join();
 
-        t_send_test.join();
-        t_recv_ref.join();
+        testedSentLoop.join();
+        referenceReceivedLoop.join();
     } else {
-        t_send_ref.join();
-        t_recv_test.join();
+        referenceSentLoop.join();
+        testedReceivedLoop.join();
     }
 
-    close(s_ref);
-    close(s_test);
+    close(referenceSocket);
+    close(testedSocket);
 
     std::cout << "### Test results ###\n\n";
 
-    if (!ref_sent_messages.empty() || !test_received_messages.empty())
-        compare_messages(if_ref, if_test, ref_sent_messages, test_received_messages, seconds);
+    if (!referenceSentMessages.empty() || !testedReceivedMessages.empty())
+        CompareMessages(appConfig.referenceInterface, appConfig.testedInterface, referenceSentMessages, testedReceivedMessages);
 
-    if ((!ref_sent_messages.empty() || !test_received_messages.empty()) && (!test_sent_messages.empty() || !ref_received_messages.empty()))
+    if ((!referenceSentMessages.empty() || !testedReceivedMessages.empty()) && (!testedSentMessages.empty() || !referenceReceivedMessages.empty()))
         std::cout << std::endl;
 
-    if (!test_sent_messages.empty() || !ref_received_messages.empty())
-        compare_messages(if_test, if_ref, test_sent_messages, ref_received_messages, seconds);
+    if (!testedSentMessages.empty() || !referenceReceivedMessages.empty())
+        CompareMessages(appConfig.testedInterface, appConfig.referenceInterface, testedSentMessages, referenceReceivedMessages);
 
+    if (appConfig.saveMode == "save") {
+        if (!referenceSentMessages.empty())
+            SaveMessagesToCap(appConfig.referenceInterface, "sent.cap", referenceSentMessages);
+        if (!referenceReceivedMessages.empty())
+            SaveMessagesToCap(appConfig.referenceInterface, "received.cap", referenceReceivedMessages);
 
-    if (save_mode == "save") {
-        if (!ref_sent_messages.empty())
-            save_messages_to_cap(if_ref, "sent.cap", ref_sent_messages, seed_str);
-        if (!ref_received_messages.empty())
-            save_messages_to_cap(if_ref, "received.cap", ref_received_messages, seed_str);
-
-        if (!test_sent_messages.empty())
-            save_messages_to_cap(if_test, "sent.cap", test_sent_messages, seed_str);
-        if (!test_received_messages.empty())
-            save_messages_to_cap(if_test, "received.cap", test_received_messages, seed_str);
+        if (!testedSentMessages.empty())
+            SaveMessagesToCap(appConfig.testedInterface, "sent.cap", testedSentMessages);
+        if (!testedReceivedMessages.empty())
+            SaveMessagesToCap(appConfig.testedInterface, "received.cap", testedReceivedMessages);
     }
 
     return 0;
