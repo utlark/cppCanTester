@@ -1,4 +1,5 @@
 #include <atomic>
+#include <csignal>
 #include <fcntl.h>
 #include <fstream>
 #include <iostream>
@@ -24,7 +25,7 @@ struct Config {
     std::string duplexMode = "duplex";
     int msgPerSec = -1;
     int seconds = 1;
-    std::string saveMode = "no_save";
+    std::string saveMode = "no-save";
     std::string seedStr = "random";
     int timeoutSec = 15;
 };
@@ -38,6 +39,39 @@ std::uniform_int_distribution<int> disIdType(0, 1);
 
 std::uniform_int_distribution<uint8_t> disCanDlc(1, 8);
 std::uniform_int_distribution<uint8_t> disCanData(0, 255);
+
+int referenceSocket = -1;
+int testedSocket = -1;
+
+std::thread referenceSentLoop{}, referenceReceivedLoop{}, testedSentLoop{}, testedReceivedLoop{};
+
+void CloseSignalHandler([[maybe_unused]] int signalNumber) {
+    shutdownRequested.store(true);
+
+    if (referenceSentLoop.joinable())
+        referenceSentLoop.join();
+    if (referenceReceivedLoop.joinable())
+        referenceReceivedLoop.join();
+
+    if (testedReceivedLoop.joinable())
+        testedReceivedLoop.join();
+    if (testedSentLoop.joinable())
+        testedSentLoop.join();
+
+    if (referenceSocket >= 0)
+        close(referenceSocket);
+    if (testedSocket >= 0)
+        close(testedSocket);
+}
+
+void SetupSignals() {
+    struct sigaction signalAction{};
+    signalAction.sa_handler = CloseSignalHandler;
+    sigemptyset(&signalAction.sa_mask);
+    signalAction.sa_flags = 0;
+    sigaction(SIGINT, &signalAction, nullptr);
+    sigaction(SIGTERM, &signalAction, nullptr);
+}
 
 int OpenCanSocket(const std::string &interfaceName) {
     int socketFd = socket(PF_CAN, SOCK_RAW, CAN_RAW);
@@ -207,59 +241,59 @@ void LoadConfig(int argc, char *argv[]) {
 
     options.add_options()
             ("h,help", "Print usage")
-            ("if_ref", "Reference interface name", cxxopts::value<std::string>())
-            ("if_test", "Tested interface name", cxxopts::value<std::string>())
-            ("id_type", "ID type: short|long|mix", cxxopts::value<std::string>()->default_value("mix"))
-            ("duplex_mode", "Duplex mode: duplex|full_duplex", cxxopts::value<std::string>()->default_value("duplex"))
-            ("msg_per_sec", "Messages per second: int or max", cxxopts::value<std::string>()->default_value("max"))
+            ("if-ref", "Reference interface name", cxxopts::value<std::string>())
+            ("if-test", "Tested interface name", cxxopts::value<std::string>())
+            ("id-type", "ID type: short|long|mix", cxxopts::value<std::string>()->default_value("mix"))
+            ("duplex-mode", "Duplex mode: duplex|full-duplex", cxxopts::value<std::string>()->default_value("duplex"))
+            ("msg-per-sec", "Messages per second: int or max", cxxopts::value<std::string>()->default_value("max"))
             ("sec", "Test duration in seconds", cxxopts::value<int>()->default_value("1"))
-            ("save_mode", "Save mode: save|no_save", cxxopts::value<std::string>()->default_value("no_save"))
+            ("save-mode", "Save mode: save|no-save", cxxopts::value<std::string>()->default_value("no-save"))
             ("seed", "Seed: int or random", cxxopts::value<std::string>()->default_value("random"))
-            ("timeout_sec", "Timeout in seconds", cxxopts::value<int>()->default_value("15"));
+            ("timeout-sec", "Timeout in seconds", cxxopts::value<int>()->default_value("15"));
 
     auto parse = options.parse(argc, argv);
 
     if (parse.count("help")) {
         std::cout << options.help() << std::endl;
-        std::cout << "\nExample: " << argv[0] << " --if_ref=can0 --if_test=can2" << std::endl;
+        std::cout << "\nExample: " << argv[0] << " --if-ref=can0 --if-test=can2" << std::endl;
         exit(0);
     }
 
-    if (!parse.count("if_ref") || !parse.count("if_test")) {
-        std::cerr << "Error: '--if_ref' and '--if_test' are required.\n";
+    if (!parse.count("if-ref") || !parse.count("if-test")) {
+        std::cerr << "Error: '--if-ref' and '--if-test' are required.\n";
         std::cout << options.help() << std::endl;
         exit(1);
     }
 
-    appConfig.referenceInterface = parse["if_ref"].as<std::string>();
-    appConfig.testedInterface = parse["if_test"].as<std::string>();
-    appConfig.idType = parse["id_type"].as<std::string>();
-    appConfig.duplexMode = parse["duplex_mode"].as<std::string>();
+    appConfig.referenceInterface = parse["if-ref"].as<std::string>();
+    appConfig.testedInterface = parse["if-test"].as<std::string>();
+    appConfig.idType = parse["id-type"].as<std::string>();
+    appConfig.duplexMode = parse["duplex-mode"].as<std::string>();
     appConfig.seconds = parse["sec"].as<int>();
-    appConfig.saveMode = parse["save_mode"].as<std::string>();
+    appConfig.saveMode = parse["save-mode"].as<std::string>();
     appConfig.seedStr = parse["seed"].as<std::string>();
-    appConfig.timeoutSec = parse["timeout_sec"].as<int>();
+    appConfig.timeoutSec = parse["timeout-sec"].as<int>();
 
     if (!(appConfig.idType == "short" || appConfig.idType == "long" || appConfig.idType == "mix"))
-        throw std::invalid_argument("Invalid '--id_type'. It must be 'short', 'long', or 'mix'.\n");
+        throw std::invalid_argument("Invalid '--id-type'. It must be 'short', 'long', or 'mix'.\n");
 
-    if (!(appConfig.duplexMode == "duplex" || appConfig.duplexMode == "full_duplex"))
-        throw std::invalid_argument("Invalid '--duplex_mode'. It must be 'duplex' or 'full_duplex'.\n");
+    if (!(appConfig.duplexMode == "duplex" || appConfig.duplexMode == "full-duplex"))
+        throw std::invalid_argument("Invalid '--duplex-mode'. It must be 'duplex' or 'full-duplex'.\n");
 
-    std::string msg_per_sec_str = parse["msg_per_sec"].as<std::string>();
-    if (msg_per_sec_str == "max")
+    std::string msgPerSecStr = parse["msg-per-sec"].as<std::string>();
+    if (msgPerSecStr == "max")
         appConfig.msgPerSec = -1;
     else
         try {
-            appConfig.msgPerSec = std::stoi(msg_per_sec_str);
+            appConfig.msgPerSec = std::stoi(msgPerSecStr);
             if (appConfig.msgPerSec <= 0)
-                throw std::invalid_argument("Invalid '--msg_per_sec'. It must be a positive integer or 'max'\n");
+                throw std::invalid_argument("Invalid '--msg-per-sec'. It must be a positive integer or 'max'\n");
         } catch (...) {
-            throw std::invalid_argument("Invalid '--msg_per_sec'. It must be a positive integer or 'max'.\n");
+            throw std::invalid_argument("Invalid '--msg-per-sec'. It must be a positive integer or 'max'.\n");
         }
 
-    if (!(appConfig.saveMode == "save" || appConfig.saveMode == "no_save"))
-        throw std::invalid_argument("Invalid '--save_mode'. It must be 'save' or 'no_save'.\n");
+    if (!(appConfig.saveMode == "save" || appConfig.saveMode == "no-save"))
+        throw std::invalid_argument("Invalid '--save-mode'. It must be 'save' or 'no-save'.\n");
 
     if (appConfig.seedStr != "random")
         try {
@@ -273,6 +307,7 @@ void LoadConfig(int argc, char *argv[]) {
 }
 
 int main(int argc, char *argv[]) {
+    SetupSignals();
     LoadConfig(argc, argv);
 
     std::random_device rngDeviceForReference;
@@ -287,8 +322,8 @@ int main(int argc, char *argv[]) {
         rngGeneratorForTested.seed(seed + 1);
     }
 
-    int referenceSocket = OpenCanSocket(appConfig.referenceInterface);
-    int testedSocket = OpenCanSocket(appConfig.testedInterface);
+    referenceSocket = OpenCanSocket(appConfig.referenceInterface);
+    testedSocket = OpenCanSocket(appConfig.testedInterface);
 
     int socketBuffer = 500000;
     setsockopt(referenceSocket, SOL_SOCKET, SO_SNDBUF, &socketBuffer, sizeof(socketBuffer));
@@ -302,11 +337,10 @@ int main(int argc, char *argv[]) {
     flags = fcntl(testedSocket, F_GETFL, 0);
     fcntl(testedSocket, F_SETFL, flags | O_NONBLOCK);
 
-    std::thread referenceSentLoop{}, referenceReceivedLoop{}, testedSentLoop{}, testedReceivedLoop{};
     std::atomic<size_t> referenceSentCounter{0}, referenceReceivedCounter{0}, testedSentCounter{0}, testedReceivedCounter{0};
     std::vector<MessageBox> referenceSentMessages{}, referenceReceivedMessages{}, testedSentMessages{}, testedReceivedMessages{};
 
-    if (appConfig.duplexMode == "full_duplex") {
+    if (appConfig.duplexMode == "full-duplex") {
         referenceReceivedLoop = std::thread(ReceiverLoop, referenceSocket, std::ref(referenceReceivedCounter), std::ref(referenceReceivedMessages), std::ref(testedSentCounter));
         testedReceivedLoop = std::thread(ReceiverLoop, testedSocket, std::ref(testedReceivedCounter), std::ref(testedReceivedMessages), std::ref(referenceSentCounter));
 
@@ -323,21 +357,7 @@ int main(int argc, char *argv[]) {
     }
 
     std::this_thread::sleep_for(std::chrono::seconds(appConfig.seconds));
-    shutdownRequested.store(true);
-
-    if (appConfig.duplexMode == "full_duplex") {
-        referenceSentLoop.join();
-        testedReceivedLoop.join();
-
-        testedSentLoop.join();
-        referenceReceivedLoop.join();
-    } else {
-        referenceSentLoop.join();
-        testedReceivedLoop.join();
-    }
-
-    close(referenceSocket);
-    close(testedSocket);
+    CloseSignalHandler(0);
 
     std::cout << "### Test results ###\n\n";
 
